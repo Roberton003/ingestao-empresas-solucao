@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS {table} (
 #
 # Regras de derivação:
 #   1. cnpj_basico: zero-padded 8 dígitos
-#   2. razao_social: UPPER + TRIM
+#   2. razao_social: UPPER + TRIM + sem espaços (DQ-02 valida \s)
 #   3. porte_codigo: vazio → '00'
 #   4. porte_descricao: CASE baseado em porte_codigo
 #   5. capital_social: remove ponto milhar, troca vírgula por ponto, cast DOUBLE
@@ -125,7 +125,9 @@ DQ_QUERIES: Final[dict[str, str]] = {
     """,
     "DQ-02": """
         SELECT COUNT(*) FROM {table}
-        WHERE razao_social != UPPER(TRIM(razao_social))
+        WHERE razao_social IS NULL
+           OR razao_social = ''
+           OR razao_social != UPPER(TRIM(razao_social))
     """,
     "DQ-03": """
         SELECT COUNT(*) FROM {table}
