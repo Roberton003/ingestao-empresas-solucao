@@ -19,4 +19,7 @@ Thumbs.db
 .env.local
 
 # Internal harness docs (not for solution repo)
-docs/
+docs/CONTEXT_CURRENT.md
+docs/PRD.md
+docs/test_consistency_report.md
+docs/session-handoffs/
