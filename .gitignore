@@ -19,5 +19,4 @@ Thumbs.db
 .env.local
 
 # Internal harness docs (not for solution repo)
-docs/CONTEXT_CURRENT.md
-docs/session-handoffs/
+docs/
