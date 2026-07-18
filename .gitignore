@@ -29,3 +29,4 @@ test_data/
 tests/generate_realistic_data.py
 tests/run_benchmark.sh
 docker-compose.test.yml
+tests/
