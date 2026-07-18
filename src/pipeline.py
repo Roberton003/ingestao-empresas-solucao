@@ -37,7 +37,9 @@ from schema import DDL_TEMPLATE, DERIVATION_SQL
 # ─── Constantes ──────────────────────────────────────────────────────────────
 
 ZIP_DIR: str = "/data"
-CHUNK_SIZE: int = 50_000  # linhas por chunk COPY
+CHUNK_SIZE: int = (
+    200_000  # linhas por chunk COPY (aumentado de 50k para reduzir overhead)
+)
 DUCKDB_MEMORY_LIMIT: str = "400MB"
 DUCKDB_TEMP_DIR: str = "/app/duckdb_temp"
 DQ_CHECK_INTERVAL: int = 500000  # verificar OOM a cada ~500k linhas
@@ -134,7 +136,8 @@ def _process_csv(
                     f"COPY {pg_table} FROM STDIN (FORMAT CSV, DELIMITER ';', NULL '')",
                     buf,
                 )
-            pg_conn.commit()
+            # Commit ao final de cada ZIP (não por chunk) — reduz ~1.373 commits
+            # para 10 commits no total. Seguro com synchronous_commit=off.
 
             total_rows += len(rows)
             print(f"  [COPY] {label}: +{len(rows):,} linhas (acumulado {total_rows:,})")
@@ -207,6 +210,9 @@ def process_zip(
 
     # ── Limpeza ───────────────────────────────────────────────────────────
     shutil.rmtree(extract_dir, ignore_errors=True)
+
+    # Commit único ao final do ZIP (não por chunk) — economiza ~1.373 round-trips
+    pg_conn.commit()
 
     print(f"[ZIP] {basename} concluído — {grand_total:,} linhas.")
     return grand_total
@@ -283,4 +289,21 @@ def run_pipeline(pg_conn, pg_table: str) -> int:
 
     elapsed_total = time.time() - start
     print(f"\n[PIPELINE] Total: {grand_total:,} linhas em {elapsed_total:.1f}s.")
+
+    # Log de RAM pico
+    rss_peak = _get_rss_mb()
+    if rss_peak is not None:
+        print(f"[MEM] Pico RSS: {rss_peak:.0f} MB")
     return grand_total
+
+
+def _get_rss_mb() -> float | None:
+    """Lê RSS atual de /proc/self/status."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    return int(parts[1]) / 1024
+    except (FileNotFoundError, IndexError, ValueError):
+        return None
