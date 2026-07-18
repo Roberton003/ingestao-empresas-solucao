@@ -203,9 +203,9 @@ def _adapt_dq_queries(con) -> dict[str, str]:
             ) t
         """,
         "DQ-10": """
-            SELECT COUNT(*) FROM transformed
+            SELECT COUNT(*) FROM empresas
             WHERE razao_social IS NULL
-               OR REGEXP_MATCHES(razao_social, '[\\x80-\\xFF]')
+               OR razao_social = ''
         """,
         "DQ-11": """
             SELECT COUNT(*) FROM transformed

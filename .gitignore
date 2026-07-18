@@ -23,3 +23,9 @@ docs/CONTEXT_CURRENT.md
 docs/PRD.md
 docs/test_consistency_report.md
 docs/session-handoffs/
+
+# Benchmark and test data (local only)
+test_data/
+tests/generate_realistic_data.py
+tests/run_benchmark.sh
+docker-compose.test.yml

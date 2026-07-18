@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS {table} (
     qualificacao_responsavel VARCHAR(2) NOT NULL,
     capital_social           DOUBLE PRECISION NOT NULL,
     porte_codigo             VARCHAR(2) NOT NULL,
-    porte_descricao          VARCHAR(20) NOT NULL,
+    porte_descricao          VARCHAR(30) NOT NULL,
     ente_federativo          VARCHAR(100),
     capital_social_faixa     VARCHAR(20) NOT NULL,
     is_mei                   BOOLEAN NOT NULL,
@@ -172,7 +172,7 @@ DQ_QUERIES: Final[dict[str, str]] = {
     "DQ-10": """
         SELECT COUNT(*) FROM {table}
         WHERE razao_social IS NULL
-           OR razao_social ~ '[\\x80-\\xFF]'
+           OR razao_social = ''
     """,
     "DQ-11": """
         SELECT COUNT(*) FROM {table}
