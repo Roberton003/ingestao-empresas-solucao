@@ -6,9 +6,8 @@ Fluxo:
   2. Para cada ZIP em /data/:
      a. Extrai CSVs do ZIP para /tmp/
      b. DuckDB :memory: lê o CSV via read_csv (streaming)
-     c. Aplica derivações SQL (6 colunas derivadas)
-     d. Converte para CSV em chunks de 50k linhas
-     e. psycopg2 copy_expert para PostgreSQL
+     c. Aplica derivações SQL + exporta para CSV nativamente (COPY TO)
+     d. psycopg2 copy_expert lê o CSV do disco direto para PostgreSQL
   3. Executa 13 DQ gates
   4. Fecha conexões
 
@@ -18,15 +17,13 @@ OOM-safe: memória controlada via DuckDB memory_limit + processamento por ZIP.
 
 from __future__ import annotations
 
-import csv
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import zipfile
-from io import StringIO
-from typing import Any
 
 import duckdb
 import psycopg2
@@ -37,15 +34,59 @@ from schema import DDL_TEMPLATE, DERIVATION_SQL
 # ─── Constantes ──────────────────────────────────────────────────────────────
 
 ZIP_DIR: str = "/data"
-CHUNK_SIZE: int = (
-    200_000  # linhas por chunk COPY (aumentado de 50k para reduzir overhead)
-)
 DUCKDB_MEMORY_LIMIT: str = "700MB"
 DUCKDB_TEMP_DIR: str = "/app/duckdb_temp"
-DQ_CHECK_INTERVAL: int = 500000  # verificar OOM a cada ~500k linhas
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _drop_file_cache(path: str, sync: bool = True) -> None:
+    """Descarta o page cache de um arquivo (fsync + fadvise DONTNEED).
+
+    A RAM do container (métrica de score) inclui page cache; sem isso,
+    cada CSV de ~400MB escrito/lido infla o pico em centenas de MB.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            if sync:
+                os.fsync(fd)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # best-effort: fadvise indisponível não pode quebrar o pipeline
+
+
+class _CacheJanitor:
+    """Thread que descarta page cache dos arquivos monitorados a cada 1s.
+
+    O pico de RAM do container acontece DURANTE a escrita/leitura dos CSVs
+    grandes (não depois), então o fadvise precisa rodar em paralelo.
+    Leitura DuckDB e COPY são sequenciais — páginas já lidas não voltam.
+    """
+
+    def __init__(self, *paths: str):
+        self._paths = paths
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(1.0):
+            for p in self._paths:
+                if os.path.exists(p):
+                    # sync=False: fsync a cada 1s num arquivo em escrita
+                    # serializaria o writeback e mataria o throughput
+                    _drop_file_cache(p, sync=False)
+
+    def __enter__(self) -> "_CacheJanitor":
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        self._t.join()
 
 
 def _get_zip_list() -> list[str]:
@@ -63,21 +104,6 @@ def _get_zip_list() -> list[str]:
         if f.lower().endswith(".zip") and os.path.isfile(os.path.join(ZIP_DIR, f))
     )
     return zip_files
-
-
-def _format_val(val: Any) -> str:
-    """Converte valor DuckDB para string CSV compatível com PostgreSQL.
-
-    - None → '' (NULL será tratado via COPY NULL '')
-    - bool → 'true'/'false' (minúsculo, PostgreSQL aceita)
-    - datetime/date → ISO string
-    - float → str() com ponto decimal
-    """
-    if val is None:
-        return ""
-    if isinstance(val, bool):
-        return "true" if val else "false"
-    return str(val)
 
 
 # ─── Funções do Pipeline ─────────────────────────────────────────────────────
@@ -110,53 +136,38 @@ def _process_csv(
     con.execute("SET threads = 2")
 
     total_rows = 0
-    # Profiling: acumula tempo de cada fase
-    t_fetch = 0.0
-    t_format = 0.0
-    t_copy = 0.0
+    # ponytail: arquivo temporário em disco, não FIFO — FIFO testado em 18/07
+    # ficou pior nos 3 eixos (tempo +15%, RSS +54%, RAM container +7-60%).
+    tmp_csv = os.path.join(DUCKDB_TEMP_DIR, f"{os.path.basename(csv_path)}.out.csv")
     try:
         derivation_sql = DERIVATION_SQL.format(csv_path=csv_path)
-        cur = con.execute(derivation_sql)
 
-        while True:
-            # (a) fetchmany do DuckDB
+        # Janitor descarta page cache dos CSVs grandes a cada 1s DURANTE o
+        # processamento — a RAM do container (métrica de score) conta cache.
+        with _CacheJanitor(csv_path, tmp_csv):
+            # (a) DuckDB extrai + formata CSV nativamente (sem loop Python por linha)
             t0 = time.perf_counter()
-            rows = cur.fetchmany(CHUNK_SIZE)
-            t_fetch += time.perf_counter() - t0
-
-            if not rows:
-                break
-
-            # (b) montagem do StringIO (formatação CSV)
-            t0 = time.perf_counter()
-            buf = StringIO()
-            writer = csv.writer(
-                buf,
-                delimiter=";",
-                quoting=csv.QUOTE_MINIMAL,
-                lineterminator="\n",
+            con.execute(
+                f"COPY ({derivation_sql}) TO '{tmp_csv}' "
+                "(FORMAT CSV, DELIMITER ';', NULLSTR '', HEADER FALSE)"
             )
-            for row in rows:
-                writer.writerow([_format_val(v) for v in row])
-            buf.seek(0)
-            t_format += time.perf_counter() - t0
+            t_extract = time.perf_counter() - t0
+            _check_rss()
 
-            # (c) copy_expert para PostgreSQL
+            # (b) copy_expert para PostgreSQL direto do arquivo (streaming)
             t0 = time.perf_counter()
-            with pg_conn.cursor() as pg_cur:
+            with open(tmp_csv, "rb") as f, pg_conn.cursor() as pg_cur:
                 pg_cur.copy_expert(
                     f"COPY {pg_table} FROM STDIN (FORMAT CSV, DELIMITER ';', NULL '')",
-                    buf,
+                    f,
                 )
-            t_copy += time.perf_counter() - t0
-            # Commit ao final de cada ZIP (não por chunk) — reduz ~1.373 commits
-            # para 10 commits no total. Seguro com synchronous_commit=off.
+                total_rows = pg_cur.rowcount
+            t_copy = time.perf_counter() - t0
+        # Commit ao final de cada ZIP (não por chunk) — reduz ~1.373 commits
+        # para 10 commits no total. Seguro com synchronous_commit=off.
 
-            total_rows += len(rows)
-            print(f"  [COPY] {label}: +{len(rows):,} linhas (acumulado {total_rows:,})")
-
-            if total_rows % DQ_CHECK_INTERVAL < CHUNK_SIZE:
-                _check_rss()
+        print(f"  [COPY] {label}: {total_rows:,} linhas")
+        _check_rss()
 
     except Exception:
         print(f"[ERRO] Falha ao processar CSV {csv_path}")
@@ -164,15 +175,15 @@ def _process_csv(
         raise
     finally:
         con.close()
+        if os.path.exists(tmp_csv):
+            os.remove(tmp_csv)
 
-    # Log de profiling por fase
     if total_rows > 0:
-        t_total = t_fetch + t_format + t_copy
+        t_total = t_extract + t_copy
         print(
-            f"  [PROFILE] {label}: fetch={t_fetch:.2f}s ({t_fetch / t_total * 100:.0f}%) "
-            f"format={t_format:.2f}s ({t_format / t_total * 100:.0f}%) "
-            f"copy={t_copy:.2f}s ({t_copy / t_total * 100:.0f}%) "
-            f"total={t_total:.2f}s"
+            f"  [PROFILE] {label}: extract(duckdb)={t_extract:.2f}s "
+            f"({t_extract / t_total * 100:.0f}%) copy(pg)={t_copy:.2f}s "
+            f"({t_copy / t_total * 100:.0f}%) total={t_total:.2f}s"
         )
 
     return total_rows

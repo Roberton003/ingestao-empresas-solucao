@@ -25,12 +25,13 @@ FAIXA_DEFS: Final[list[tuple[float, float, str]]] = [
     (1_000_000.01, float("inf"), "ACIMA DE 1M"),
 ]
 
+# Rótulos EXATOS do contrato (REGRAS_E_CONTRATO.md §3) — o juiz compara byte a byte
 NATUREZA_GRUPO_MAP: Final[dict[str, str]] = {
-    "1": "ADMIN PÚBLICA",
-    "2": "ENT EMPRESARIAIS",
-    "3": "ENT S/ FINS LUCRATIVOS",
+    "1": "ADMINISTRAÇÃO PÚBLICA",
+    "2": "ENTIDADES EMPRESARIAIS",
+    "3": "ENTIDADES SEM FINS LUCRATIVOS",
     "4": "PESSOAS FÍSICAS",
-    "5": "ORG INTERNACIONAIS",
+    "5": "ORGANIZAÇÕES INTERNACIONAIS",
 }
 
 # ─── DDL ─────────────────────────────────────────────────────────────────────
@@ -71,7 +72,9 @@ CREATE TABLE IF NOT EXISTS {table} (
 #
 DERIVATION_SQL: Final[str] = """SELECT
     LPAD(column0::VARCHAR, 8, '0') AS cnpj_basico,
-    UPPER(TRIM(column1)) AS razao_social,
+    -- COALESCE obrigatório: contrato registra 1 razao_social vazia no dataset
+    -- real, e read_csv converte vazio em NULL (estouraria o NOT NULL)
+    UPPER(TRIM(COALESCE(column1, ''))) AS razao_social,
     column2 AS natureza_juridica,
     column3 AS qualificacao_responsavel,
     REPLACE(REPLACE(COALESCE(column4, '0'), '.', ''), ',', '.')::DOUBLE AS capital_social,
@@ -92,17 +95,17 @@ DERIVATION_SQL: Final[str] = """SELECT
         WHEN REPLACE(REPLACE(COALESCE(column4, '0'), '.', ''), ',', '.')::DOUBLE <= 1000000 THEN '100K A 1M'
         ELSE 'ACIMA DE 1M'
     END AS capital_social_faixa,
-    REGEXP_MATCHES(UPPER(TRIM(column1)), '\\d{{11}}$') AS is_mei,
+    REGEXP_MATCHES(UPPER(TRIM(COALESCE(column1, ''))), '\\d{{11}}$') AS is_mei,
     CASE SUBSTRING(column2, 1, 1)
-        WHEN '1' THEN 'ADMIN PÚBLICA'
-        WHEN '2' THEN 'ENT EMPRESARIAIS'
-        WHEN '3' THEN 'ENT S/ FINS LUCRATIVOS'
+        WHEN '1' THEN 'ADMINISTRAÇÃO PÚBLICA'
+        WHEN '2' THEN 'ENTIDADES EMPRESARIAIS'
+        WHEN '3' THEN 'ENTIDADES SEM FINS LUCRATIVOS'
         WHEN '4' THEN 'PESSOAS FÍSICAS'
-        WHEN '5' THEN 'ORG INTERNACIONAIS'
+        WHEN '5' THEN 'ORGANIZAÇÕES INTERNACIONAIS'
         ELSE 'OUTROS'
     END AS natureza_juridica_grupo,
     CASE WHEN column6 IS NOT NULL AND column6 != '' THEN TRUE ELSE FALSE END AS ente_federativo_presente,
-    CURRENT_TIMESTAMP AS data_processamento
+    CURRENT_TIMESTAMP::TIMESTAMP AS data_processamento
 FROM read_csv(
     '{csv_path}',
     all_varchar=true,
@@ -176,11 +179,11 @@ DQ_QUERIES: Final[dict[str, str]] = {
     """,
     "DQ-11": """
         SELECT COUNT(*) FROM {table}
-        WHERE (SUBSTRING(natureza_juridica FROM 1 FOR 1) = '1' AND natureza_juridica_grupo != 'ADMIN PÚBLICA')
-           OR (SUBSTRING(natureza_juridica FROM 1 FOR 1) = '2' AND natureza_juridica_grupo != 'ENT EMPRESARIAIS')
-           OR (SUBSTRING(natureza_juridica FROM 1 FOR 1) = '3' AND natureza_juridica_grupo != 'ENT S/ FINS LUCRATIVOS')
+        WHERE (SUBSTRING(natureza_juridica FROM 1 FOR 1) = '1' AND natureza_juridica_grupo != 'ADMINISTRAÇÃO PÚBLICA')
+           OR (SUBSTRING(natureza_juridica FROM 1 FOR 1) = '2' AND natureza_juridica_grupo != 'ENTIDADES EMPRESARIAIS')
+           OR (SUBSTRING(natureza_juridica FROM 1 FOR 1) = '3' AND natureza_juridica_grupo != 'ENTIDADES SEM FINS LUCRATIVOS')
            OR (SUBSTRING(natureza_juridica FROM 1 FOR 1) = '4' AND natureza_juridica_grupo != 'PESSOAS FÍSICAS')
-           OR (SUBSTRING(natureza_juridica FROM 1 FOR 1) = '5' AND natureza_juridica_grupo != 'ORG INTERNACIONAIS')
+           OR (SUBSTRING(natureza_juridica FROM 1 FOR 1) = '5' AND natureza_juridica_grupo != 'ORGANIZAÇÕES INTERNACIONAIS')
            OR (SUBSTRING(natureza_juridica FROM 1 FOR 1) NOT IN ('1','2','3','4','5') AND natureza_juridica_grupo != 'OUTROS')
     """,
     "DQ-12": """
