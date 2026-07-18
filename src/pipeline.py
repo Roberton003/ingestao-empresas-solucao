@@ -40,7 +40,7 @@ ZIP_DIR: str = "/data"
 CHUNK_SIZE: int = (
     200_000  # linhas por chunk COPY (aumentado de 50k para reduzir overhead)
 )
-DUCKDB_MEMORY_LIMIT: str = "400MB"
+DUCKDB_MEMORY_LIMIT: str = "700MB"
 DUCKDB_TEMP_DIR: str = "/app/duckdb_temp"
 DQ_CHECK_INTERVAL: int = 500000  # verificar OOM a cada ~500k linhas
 
@@ -110,16 +110,25 @@ def _process_csv(
     con.execute("SET threads = 2")
 
     total_rows = 0
+    # Profiling: acumula tempo de cada fase
+    t_fetch = 0.0
+    t_format = 0.0
+    t_copy = 0.0
     try:
         derivation_sql = DERIVATION_SQL.format(csv_path=csv_path)
         cur = con.execute(derivation_sql)
 
         while True:
+            # (a) fetchmany do DuckDB
+            t0 = time.perf_counter()
             rows = cur.fetchmany(CHUNK_SIZE)
+            t_fetch += time.perf_counter() - t0
+
             if not rows:
                 break
 
-            # Converte para CSV buffer
+            # (b) montagem do StringIO (formatação CSV)
+            t0 = time.perf_counter()
             buf = StringIO()
             writer = csv.writer(
                 buf,
@@ -130,12 +139,16 @@ def _process_csv(
             for row in rows:
                 writer.writerow([_format_val(v) for v in row])
             buf.seek(0)
+            t_format += time.perf_counter() - t0
 
+            # (c) copy_expert para PostgreSQL
+            t0 = time.perf_counter()
             with pg_conn.cursor() as pg_cur:
                 pg_cur.copy_expert(
                     f"COPY {pg_table} FROM STDIN (FORMAT CSV, DELIMITER ';', NULL '')",
                     buf,
                 )
+            t_copy += time.perf_counter() - t0
             # Commit ao final de cada ZIP (não por chunk) — reduz ~1.373 commits
             # para 10 commits no total. Seguro com synchronous_commit=off.
 
@@ -151,6 +164,16 @@ def _process_csv(
         raise
     finally:
         con.close()
+
+    # Log de profiling por fase
+    if total_rows > 0:
+        t_total = t_fetch + t_format + t_copy
+        print(
+            f"  [PROFILE] {label}: fetch={t_fetch:.2f}s ({t_fetch / t_total * 100:.0f}%) "
+            f"format={t_format:.2f}s ({t_format / t_total * 100:.0f}%) "
+            f"copy={t_copy:.2f}s ({t_copy / t_total * 100:.0f}%) "
+            f"total={t_total:.2f}s"
+        )
 
     return total_rows
 
