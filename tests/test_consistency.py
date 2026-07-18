@@ -210,11 +210,11 @@ def adapt_dq_queries() -> dict[str, str]:
         """,
         "DQ-11": """
             SELECT COUNT(*) FROM transformed
-            WHERE (SUBSTRING(natureza_juridica, 1, 1) = '1' AND natureza_juridica_grupo != 'ADMIN PÚBLICA')
-               OR (SUBSTRING(natureza_juridica, 1, 1) = '2' AND natureza_juridica_grupo != 'ENT EMPRESARIAIS')
-               OR (SUBSTRING(natureza_juridica, 1, 1) = '3' AND natureza_juridica_grupo != 'ENT S/ FINS LUCRATIVOS')
+            WHERE (SUBSTRING(natureza_juridica, 1, 1) = '1' AND natureza_juridica_grupo != 'ADMINISTRAÇÃO PÚBLICA')
+               OR (SUBSTRING(natureza_juridica, 1, 1) = '2' AND natureza_juridica_grupo != 'ENTIDADES EMPRESARIAIS')
+               OR (SUBSTRING(natureza_juridica, 1, 1) = '3' AND natureza_juridica_grupo != 'ENTIDADES SEM FINS LUCRATIVOS')
                OR (SUBSTRING(natureza_juridica, 1, 1) = '4' AND natureza_juridica_grupo != 'PESSOAS FÍSICAS')
-               OR (SUBSTRING(natureza_juridica, 1, 1) = '5' AND natureza_juridica_grupo != 'ORG INTERNACIONAIS')
+               OR (SUBSTRING(natureza_juridica, 1, 1) = '5' AND natureza_juridica_grupo != 'ORGANIZAÇÕES INTERNACIONAIS')
                OR (SUBSTRING(natureza_juridica, 1, 1) NOT IN ('1','2','3','4','5') AND natureza_juridica_grupo != 'OUTROS')
         """,
         "DQ-12": """
@@ -493,7 +493,7 @@ def main():
         fator_escala = 68_629_148 / 100_000
         tempo_projetado = tempo_medio_100k * fator_escala * 0.6  # overhead I/O reduz
         ram_projetada = max(ram_media, 50)  # RAM escala parcialmente
-        storage_projetado = 8783  # Apêndice A do PRD
+        storage_projetado = 8783  # medido em benchmark multi-ZIP anterior
 
         score = 1000 * (
             0.60 * tempo_projetado / 3600
@@ -509,10 +509,6 @@ def main():
         print(f"  RAM projetada:            ~{ram_projetada:.0f} MB")
         print(f"  Storage projetado:        ~{storage_projetado} MB")
         print(f"  SCORE PROJETADO:          ~{score:.0f}")
-        print(f"  Líder atual:              854,1")
-        print(
-            f"  Margem:                   {(854.1 - score) / 854.1 * 100:.1f}% abaixo do líder"
-        )
 
     # ── Resultado Final ────────────────────────────────────────────────
     print(f"\n{'=' * 72}")

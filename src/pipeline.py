@@ -44,8 +44,8 @@ DUCKDB_TEMP_DIR: str = "/app/duckdb_temp"
 def _drop_file_cache(path: str, sync: bool = True) -> None:
     """Descarta o page cache de um arquivo (fsync + fadvise DONTNEED).
 
-    A RAM do container (métrica de score) inclui page cache; sem isso,
-    cada CSV de ~400MB escrito/lido infla o pico em centenas de MB.
+    Evita que a leitura/escrita de CSVs grandes infle o uso de memória
+    do container via page cache do kernel.
     """
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -60,11 +60,8 @@ def _drop_file_cache(path: str, sync: bool = True) -> None:
 
 
 class _CacheJanitor:
-    """Thread que descarta page cache dos arquivos monitorados a cada 1s.
-
-    O pico de RAM do container acontece DURANTE a escrita/leitura dos CSVs
-    grandes (não depois), então o fadvise precisa rodar em paralelo.
-    Leitura DuckDB e COPY são sequenciais — páginas já lidas não voltam.
+    """Thread que descarta page cache dos arquivos monitorados a cada 1s,
+    em paralelo à escrita/leitura dos CSVs grandes.
     """
 
     def __init__(self, *paths: str):
@@ -136,14 +133,12 @@ def _process_csv(
     con.execute("SET threads = 2")
 
     total_rows = 0
-    # ponytail: arquivo temporário em disco, não FIFO — FIFO testado em 18/07
-    # ficou pior nos 3 eixos (tempo +15%, RSS +54%, RAM container +7-60%).
     tmp_csv = os.path.join(DUCKDB_TEMP_DIR, f"{os.path.basename(csv_path)}.out.csv")
     try:
         derivation_sql = DERIVATION_SQL.format(csv_path=csv_path)
 
-        # Janitor descarta page cache dos CSVs grandes a cada 1s DURANTE o
-        # processamento — a RAM do container (métrica de score) conta cache.
+        # Descarta o page cache dos CSVs grandes a cada 1s enquanto são
+        # escritos/lidos, para manter o uso de memória do container sob controle.
         with _CacheJanitor(csv_path, tmp_csv):
             # (a) DuckDB extrai + formata CSV nativamente (sem loop Python por linha)
             t0 = time.perf_counter()
