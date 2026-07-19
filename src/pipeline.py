@@ -6,7 +6,9 @@ Fluxo:
   2. Para cada ZIP em /data/:
      a. Extrai CSVs do ZIP para /tmp/
      b. DuckDB :memory: lê o CSV via read_csv (streaming)
-     c. Aplica derivações SQL + exporta para CSV nativamente (COPY TO)
+     c. Aplica derivações SQL, dedupa cnpj_basico (intra-CSV via ROW_NUMBER
+        + inter-CSV via anti-join contra estado persistido em disco) e
+        exporta para CSV nativamente (COPY TO)
      d. psycopg2 copy_expert lê o CSV do disco direto para PostgreSQL
   3. Fecha conexões
 
@@ -34,6 +36,9 @@ from schema import DDL_TEMPLATE, DERIVATION_SQL
 ZIP_DIR: str = "/data"
 DUCKDB_MEMORY_LIMIT: str = "700MB"
 DUCKDB_TEMP_DIR: str = "/app/duckdb_temp"
+# Estado persistido entre CSVs (arquivo DuckDB on-disk) para dedup incremental
+# de cnpj_basico: evita um DELETE full-scan no Postgres pós-carga.
+DEDUP_STATE_DB: str = os.path.join(DUCKDB_TEMP_DIR, "dedup_state.duckdb")
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -129,6 +134,8 @@ def _process_csv(
     con.execute(f"SET memory_limit = '{DUCKDB_MEMORY_LIMIT}'")
     con.execute(f"SET temp_directory = '{DUCKDB_TEMP_DIR}'")
     con.execute("SET threads = 2")
+    con.execute(f"ATTACH '{DEDUP_STATE_DB}' AS state")
+    con.execute("CREATE TABLE IF NOT EXISTS state.seen_cnpj (cnpj_basico VARCHAR)")
 
     total_rows = 0
     tmp_csv = os.path.join(DUCKDB_TEMP_DIR, f"{os.path.basename(csv_path)}.out.csv")
@@ -138,12 +145,33 @@ def _process_csv(
         # Descarta o page cache dos CSVs grandes a cada 1s enquanto são
         # escritos/lidos, para manter o uso de memória do container sob controle.
         with _CacheJanitor(csv_path, tmp_csv):
-            # (a) DuckDB extrai + formata CSV nativamente (sem loop Python por linha)
+            # (a) DuckDB extrai + formata CSV nativamente (sem loop Python por linha),
+            # dedupa cnpj_basico dentro do CSV (ROW_NUMBER) e contra CSVs já
+            # processados (anti-join em state.seen_cnpj) — dedup incremental,
+            # sem varrer a tabela inteira do Postgres depois da carga.
+            # COPY direto (streaming) — sem materializar em tabela temp, que
+            # estourava RSS ao segurar o resultado inteiro em memória.
             t0 = time.perf_counter()
+            dedup_sql = f"""
+                SELECT * EXCLUDE (__rn) FROM (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY cnpj_basico) AS __rn
+                    FROM ({derivation_sql}) d
+                ) ranked
+                WHERE __rn = 1
+                  AND cnpj_basico NOT IN (SELECT cnpj_basico FROM state.seen_cnpj)
+            """
             con.execute(
-                f"COPY ({derivation_sql}) TO '{tmp_csv}' "
+                f"COPY ({dedup_sql}) TO '{tmp_csv}' "
                 "(FORMAT CSV, DELIMITER ';', NULLSTR '', HEADER FALSE)"
             )
+            # Lê de volta só o CSV já deduplicado (bem menor) pra atualizar o estado.
+            con.execute(f"""
+                INSERT INTO state.seen_cnpj
+                SELECT column00 FROM read_csv(
+                    '{tmp_csv}', sep=';', header=false, all_varchar=true,
+                    quote='"', escape='"', strict_mode=false
+                )
+            """)
             t_extract = time.perf_counter() - t0
             _check_rss()
 
@@ -249,31 +277,6 @@ def process_zip(
     return grand_total
 
 
-def _dedupe_cnpj_basico(pg_conn, pg_table: str) -> int:
-    """Remove linhas com `cnpj_basico` duplicado, mantendo a primeira ocorrência.
-
-    Passo único (GROUP BY + DELETE direcionado por ctid), não self-join
-    completo — evita índice permanente (custa storage no score) mantendo
-    o custo de uma limpeza pontual pós-carga.
-    """
-    sql = f"""
-        DELETE FROM {pg_table} t
-        USING (
-            SELECT cnpj_basico, min(ctid) AS keep_ctid
-            FROM {pg_table}
-            GROUP BY cnpj_basico
-            HAVING COUNT(*) > 1
-        ) dups
-        WHERE t.cnpj_basico = dups.cnpj_basico
-          AND t.ctid <> dups.keep_ctid
-    """
-    with pg_conn.cursor() as cur:
-        cur.execute(sql)
-        removed = cur.rowcount
-    pg_conn.commit()
-    return removed
-
-
 def _check_rss() -> None:
     """Monitora RSS via /proc/self/status e aborta se > 800 MB."""
     try:
@@ -342,12 +345,6 @@ def run_pipeline(pg_conn, pg_table: str) -> int:
             f"— {rows:,} linhas em {elapsed:.1f}s "
             f"(rate: {rows / elapsed:,.0f} linhas/s)"
         )
-
-    # ── 4. Remove duplicatas de cnpj_basico (mantém a primeira ocorrência) ──
-    removed = _dedupe_cnpj_basico(pg_conn, pg_table)
-    if removed:
-        print(f"[DEDUP] {removed:,} linha(s) duplicada(s) de cnpj_basico removida(s).")
-        grand_total -= removed
 
     elapsed_total = time.time() - start
     print(f"\n[PIPELINE] Total: {grand_total:,} linhas em {elapsed_total:.1f}s.")
