@@ -6,10 +6,9 @@ Fluxo:
   2. Para cada ZIP em /data/:
      a. Extrai CSVs do ZIP para /tmp/
      b. DuckDB :memory: lê o CSV via read_csv (streaming)
-     c. Aplica derivações SQL, dedupa cnpj_basico (intra-CSV via ROW_NUMBER
-        + inter-CSV via anti-join contra estado persistido em disco) e
-        exporta para CSV nativamente (COPY TO)
-     d. psycopg2 copy_expert lê o CSV do disco direto para PostgreSQL
+     c. Aplica derivações SQL e exporta para CSV nativamente (COPY TO)
+     d. psycopg2 copy_expert lê o CSV filtrado por um bitmap de cnpj_basico
+        (10^8 bits = 12,5 MB, O(1)/linha) que dedupa intra e inter-ZIP
   3. Fecha conexões
 
 Idempotente: TRUNCATE + recria tabela no início.
@@ -36,9 +35,10 @@ from schema import DDL_TEMPLATE, DERIVATION_SQL
 ZIP_DIR: str = "/data"
 DUCKDB_MEMORY_LIMIT: str = "700MB"
 DUCKDB_TEMP_DIR: str = "/app/duckdb_temp"
-# Estado persistido entre CSVs (arquivo DuckDB on-disk) para dedup incremental
-# de cnpj_basico: evita um DELETE full-scan no Postgres pós-carga.
-DEDUP_STATE_DB: str = os.path.join(DUCKDB_TEMP_DIR, "dedup_state.duckdb")
+# cnpj_basico tem sempre 8 dígitos → 10^8 valores possíveis. Um bitmap de
+# 10^8 bits (12,5 MB) dedupa em O(1)/linha com custo constante por ZIP —
+# o anti-join DuckDB anterior degradava conforme o estado crescia (timeout).
+BITMAP_BYTES: int = 100_000_000 // 8
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -89,6 +89,59 @@ class _CacheJanitor:
         self._t.join()
 
 
+class _BitmapDedupReader:
+    """File-like (só read) que filtra registros CSV cujo cnpj_basico
+    (primeiros 8 dígitos de cada registro) já está marcado no bitmap.
+
+    Alimenta o copy_expert do psycopg2 em streaming: nunca materializa o
+    arquivo, e o custo por linha é constante independente do volume já visto.
+    """
+
+    def __init__(self, path: str, bitmap: bytearray):
+        self._f = open(path, "rb")
+        self._bitmap = bitmap
+        self._buf = bytearray()
+        self._eof = False
+        self.removed = 0
+
+    def _next_record(self) -> bytes | None:
+        """Lê um registro lógico completo (junta linhas físicas enquanto
+        houver aspas desbalanceadas — campos com \\n embutido)."""
+        line = self._f.readline()
+        if not line:
+            return None
+        while line.count(b'"') & 1:
+            cont = self._f.readline()
+            if not cont:
+                break
+            line += cont
+        return line
+
+    def read(self, size: int = 65536) -> bytes:
+        if size < 0:
+            size = 1 << 62  # drena tudo
+        bm = self._bitmap
+        buf = self._buf
+        while not self._eof and len(buf) < size:
+            record = self._next_record()
+            if record is None:
+                self._eof = True
+                break
+            idx = int(record[:8])
+            byte, bit = idx >> 3, 1 << (idx & 7)
+            if bm[byte] & bit:
+                self.removed += 1
+            else:
+                bm[byte] |= bit
+                buf += record
+        out = bytes(buf[:size])
+        del buf[:size]
+        return out
+
+    def close(self) -> None:
+        self._f.close()
+
+
 def _get_zip_list() -> list[str]:
     """Retorna lista ordenada de paths de ZIPs válidos em /data/.
 
@@ -124,6 +177,7 @@ def _process_csv(
     pg_conn,
     pg_table: str,
     label: str,
+    bitmap: bytearray,
 ) -> int:
     """Processa um único arquivo CSV via DuckDB → PostgreSQL.
 
@@ -134,8 +188,6 @@ def _process_csv(
     con.execute(f"SET memory_limit = '{DUCKDB_MEMORY_LIMIT}'")
     con.execute(f"SET temp_directory = '{DUCKDB_TEMP_DIR}'")
     con.execute("SET threads = 2")
-    con.execute(f"ATTACH '{DEDUP_STATE_DB}' AS state")
-    con.execute("CREATE TABLE IF NOT EXISTS state.seen_cnpj (cnpj_basico VARCHAR)")
 
     total_rows = 0
     tmp_csv = os.path.join(DUCKDB_TEMP_DIR, f"{os.path.basename(csv_path)}.out.csv")
@@ -145,33 +197,13 @@ def _process_csv(
         # Descarta o page cache dos CSVs grandes a cada 1s enquanto são
         # escritos/lidos, para manter o uso de memória do container sob controle.
         with _CacheJanitor(csv_path, tmp_csv):
-            # (a) DuckDB extrai + formata CSV nativamente (sem loop Python por linha),
-            # dedupa cnpj_basico dentro do CSV (ROW_NUMBER) e contra CSVs já
-            # processados (anti-join em state.seen_cnpj) — dedup incremental,
-            # sem varrer a tabela inteira do Postgres depois da carga.
-            # COPY direto (streaming) — sem materializar em tabela temp, que
-            # estourava RSS ao segurar o resultado inteiro em memória.
+            # (a) DuckDB extrai + formata CSV nativamente (sem loop Python
+            # por linha). COPY direto (streaming) — sem materializar.
             t0 = time.perf_counter()
-            dedup_sql = f"""
-                SELECT * EXCLUDE (__rn) FROM (
-                    SELECT *, ROW_NUMBER() OVER (PARTITION BY cnpj_basico) AS __rn
-                    FROM ({derivation_sql}) d
-                ) ranked
-                WHERE __rn = 1
-                  AND cnpj_basico NOT IN (SELECT cnpj_basico FROM state.seen_cnpj)
-            """
             con.execute(
-                f"COPY ({dedup_sql}) TO '{tmp_csv}' "
+                f"COPY ({derivation_sql}) TO '{tmp_csv}' "
                 "(FORMAT CSV, DELIMITER ';', NULLSTR '', HEADER FALSE)"
             )
-            # Lê de volta só o CSV já deduplicado (bem menor) pra atualizar o estado.
-            con.execute(f"""
-                INSERT INTO state.seen_cnpj
-                SELECT column00 FROM read_csv(
-                    '{tmp_csv}', sep=';', header=false, all_varchar=true,
-                    quote='"', escape='"', strict_mode=false
-                )
-            """)
             t_extract = time.perf_counter() - t0
             _check_rss()
 
@@ -179,14 +211,24 @@ def _process_csv(
             if rejected:
                 print(f"  [WARN] {label}: {rejected:,} linha(s) rejeitada(s) pelo parser CSV (malformadas).")
 
-            # (b) copy_expert para PostgreSQL direto do arquivo (streaming)
+            # (b) copy_expert para PostgreSQL em streaming, filtrando
+            # duplicatas de cnpj_basico (intra e inter-ZIP) via bitmap
             t0 = time.perf_counter()
-            with open(tmp_csv, "rb") as f, pg_conn.cursor() as pg_cur:
-                pg_cur.copy_expert(
-                    f"COPY {pg_table} FROM STDIN (FORMAT CSV, DELIMITER ';', NULL '')",
-                    f,
+            reader = _BitmapDedupReader(tmp_csv, bitmap)
+            try:
+                with pg_conn.cursor() as pg_cur:
+                    pg_cur.copy_expert(
+                        f"COPY {pg_table} FROM STDIN (FORMAT CSV, DELIMITER ';', NULL '')",
+                        reader,
+                    )
+                    total_rows = pg_cur.rowcount
+            finally:
+                reader.close()
+            if reader.removed:
+                print(
+                    f"  [DEDUP] {label}: {reader.removed:,} duplicata(s) "
+                    f"de cnpj_basico filtrada(s)."
                 )
-                total_rows = pg_cur.rowcount
             t_copy = time.perf_counter() - t0
         # Commit ao final de cada ZIP (não por chunk) — reduz ~1.373 commits
         # para 10 commits no total. Seguro com synchronous_commit=off.
@@ -218,6 +260,7 @@ def process_zip(
     zip_path: str,
     pg_conn,
     pg_table: str,
+    bitmap: bytearray,
 ) -> int:
     """Processa um único ZIP.
 
@@ -263,7 +306,7 @@ def process_zip(
     for csv_file in csv_files:
         fname = os.path.basename(csv_file)
         print(f"  [CSV] Processando {fname} …")
-        rows = _process_csv(csv_file, pg_conn, pg_table, f"{basename}/{fname}")
+        rows = _process_csv(csv_file, pg_conn, pg_table, f"{basename}/{fname}", bitmap)
         grand_total += rows
         print(f"  [CSV] {fname}: {rows:,} linhas")
 
@@ -335,9 +378,10 @@ def run_pipeline(pg_conn, pg_table: str) -> int:
 
     print(f"[PIPELINE] {len(zip_list)} ZIP(s) encontrados.")
     grand_total = 0
+    seen_cnpj = bytearray(BITMAP_BYTES)  # 12,5 MB, vive o pipeline inteiro
     for i, zp in enumerate(zip_list, 1):
         t0 = time.time()
-        rows = process_zip(zp, pg_conn, pg_table)
+        rows = process_zip(zp, pg_conn, pg_table, seen_cnpj)
         elapsed = time.time() - t0
         grand_total += rows
         print(
