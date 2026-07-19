@@ -8,8 +8,7 @@ Fluxo:
      b. DuckDB :memory: lê o CSV via read_csv (streaming)
      c. Aplica derivações SQL + exporta para CSV nativamente (COPY TO)
      d. psycopg2 copy_expert lê o CSV do disco direto para PostgreSQL
-  3. Executa 13 DQ gates
-  4. Fecha conexões
+  3. Fecha conexões
 
 Idempotente: TRUNCATE + recria tabela no início.
 OOM-safe: memória controlada via DuckDB memory_limit + processamento por ZIP.
@@ -28,7 +27,6 @@ import zipfile
 import duckdb
 import psycopg2
 
-from dq_checks import format_dq_report, run_dq_checks
 from schema import DDL_TEMPLATE, DERIVATION_SQL
 
 # ─── Constantes ──────────────────────────────────────────────────────────────

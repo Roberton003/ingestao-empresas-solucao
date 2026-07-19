@@ -2,8 +2,8 @@
 """
 Entry point do pipeline de ingestão.
 
-Lê variáveis de ambiente, conecta ao PostgreSQL, executa o pipeline,
-roda DQ gates e exibe o relatório.
+Lê variáveis de ambiente, conecta ao PostgreSQL e executa o pipeline.
+Os gates DQ são aplicados pelo avaliador, não pelo pipeline do participante.
 
 Uso:
     PARTICIPANTE=roberton003 \
@@ -18,7 +18,7 @@ Uso:
 Exit codes:
     0   — Sucesso (G2 aprovado)
     137 — OOM kill (desclassificação)
-    1   — Erro genérico (DQ > 0, falha de conexão, etc.)
+    1   — Erro genérico (falha de conexão, erro no pipeline, etc.)
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ import sys
 
 import psycopg2
 
-from dq_checks import format_dq_report, run_dq_checks
 from pipeline import run_pipeline
 
 
@@ -83,25 +82,8 @@ def main() -> None:
         pg_conn.rollback()
         sys.exit(1)
 
-    # ── Executa DQ gates ────────────────────────────────────────────────────
-    print("\n[DQ] Executando gates de qualidade de dados …")
-    try:
-        dq_results = run_dq_checks(pg_conn, pg_table)
-        report = format_dq_report(dq_results)
-        print(report)
-    except Exception as e:
-        print(f"[ERRO] Falha nos DQ gates: {e}")
-        sys.exit(1)
-
-    # ── Verifica resultado ──────────────────────────────────────────────────
-    total_violations = sum(dq_results.values())
-    if total_violations > 0:
-        print("[RESULTADO] ❌ DQ gates reprovados — violações detectadas.")
-        print(f"[RESULTADO] Score DQ: {total_violations}")
-        sys.exit(1)
-
     # ── Sucesso ─────────────────────────────────────────────────────────────
-    print("[RESULTADO] ✅ Pipeline concluído com sucesso — todos DQ gates aprovados.")
+    print("[RESULTADO] ✅ Pipeline concluído com sucesso.")
     print(f"[RESULTADO] Total de linhas: {total_rows:,}")
     sys.exit(0)
 
