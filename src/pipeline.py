@@ -147,6 +147,10 @@ def _process_csv(
             t_extract = time.perf_counter() - t0
             _check_rss()
 
+            rejected = con.execute("SELECT COUNT(*) FROM reject_errors").fetchone()[0]
+            if rejected:
+                print(f"  [WARN] {label}: {rejected:,} linha(s) rejeitada(s) pelo parser CSV (malformadas).")
+
             # (b) copy_expert para PostgreSQL direto do arquivo (streaming)
             t0 = time.perf_counter()
             with open(tmp_csv, "rb") as f, pg_conn.cursor() as pg_cur:
@@ -245,6 +249,31 @@ def process_zip(
     return grand_total
 
 
+def _dedupe_cnpj_basico(pg_conn, pg_table: str) -> int:
+    """Remove linhas com `cnpj_basico` duplicado, mantendo a primeira ocorrência.
+
+    Passo único (GROUP BY + DELETE direcionado por ctid), não self-join
+    completo — evita índice permanente (custa storage no score) mantendo
+    o custo de uma limpeza pontual pós-carga.
+    """
+    sql = f"""
+        DELETE FROM {pg_table} t
+        USING (
+            SELECT cnpj_basico, min(ctid) AS keep_ctid
+            FROM {pg_table}
+            GROUP BY cnpj_basico
+            HAVING COUNT(*) > 1
+        ) dups
+        WHERE t.cnpj_basico = dups.cnpj_basico
+          AND t.ctid <> dups.keep_ctid
+    """
+    with pg_conn.cursor() as cur:
+        cur.execute(sql)
+        removed = cur.rowcount
+    pg_conn.commit()
+    return removed
+
+
 def _check_rss() -> None:
     """Monitora RSS via /proc/self/status e aborta se > 800 MB."""
     try:
@@ -313,6 +342,12 @@ def run_pipeline(pg_conn, pg_table: str) -> int:
             f"— {rows:,} linhas em {elapsed:.1f}s "
             f"(rate: {rows / elapsed:,.0f} linhas/s)"
         )
+
+    # ── 4. Remove duplicatas de cnpj_basico (mantém a primeira ocorrência) ──
+    removed = _dedupe_cnpj_basico(pg_conn, pg_table)
+    if removed:
+        print(f"[DEDUP] {removed:,} linha(s) duplicada(s) de cnpj_basico removida(s).")
+        grand_total -= removed
 
     elapsed_total = time.time() - start
     print(f"\n[PIPELINE] Total: {grand_total:,} linhas em {elapsed_total:.1f}s.")

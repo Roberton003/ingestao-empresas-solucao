@@ -115,7 +115,8 @@ FROM read_csv(
     header=false,
     encoding='latin-1',
     strict_mode=false,
-    ignore_errors=true
+    ignore_errors=true,
+    store_rejects=true
 )
 """
 
