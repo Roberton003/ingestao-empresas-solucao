@@ -1,5 +1,7 @@
 FROM python:3.11-slim
 
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 # Diretório para spill do DuckDB (filesystem regular, não tmpfs)
