@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pg-test-empresas-go
+    environment:
+      POSTGRES_USER: homelab_postgres
+      POSTGRES_PASSWORD: test_pass_123
+      POSTGRES_DB: db_empresas
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U homelab_postgres -d db_empresas"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    command:
+      - postgres
+      - -c
+      - synchronous_commit=off
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - maintenance_work_mem=256MB
+
+  ingestao:
+    build:
+      context: ./go
+      dockerfile: Dockerfile
+    container_name: pipeline-test-go
+    environment:
+      PARTICIPANTE: roberton003
+      PG_TABLE: public.roberton003_empresas
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: homelab_postgres
+      PG_PASSWORD: test_pass_123
+      PG_DB: db_empresas
+    volumes:
+      - ./test_data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+        reservations:
+          cpus: "2.0"
+          memory: 1g
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 2.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
