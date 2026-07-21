@@ -30,3 +30,10 @@ tests/generate_realistic_data.py
 tests/run_benchmark.sh
 docker-compose.test.yml
 tests/
+
+# Tool caches (local only)
+.tokensave/
+.pytest_cache/
+
+# Rascunhos/notas privadas (nunca publicar)
+drafts/
